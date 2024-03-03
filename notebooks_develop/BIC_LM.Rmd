@@ -1,0 +1,140 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# BIC Regression with Model Selection
+
+Load the data set and the necessary libraries and filter the outliers from the dataset, the one with a MEDV value equal to 50.
+
+```{r}
+options(warn = - 1)  
+library("dplyr")
+library(BAS)
+library(Metrics)
+housing <- read.csv("housing.csv",header=T)
+housing$X=c()
+housing <- filter(housing,housing$MEDV!= 50)
+summary(housing)
+```
+
+### BIC model selection
+
+Here we perform steb by step model selection using the BIC criterion, that is using a penalization step equal to $log(n)$.
+
+```{r}
+#BIC
+# Compute the total number of observations
+n = nrow(housing)
+
+# Full model using all predictors
+medv.lm = lm(MEDV ~ ., data= housing)
+summary(medv.lm)
+
+# Perform BIC elimination from full model
+# k = log(n): penalty for BIC rather than AIC
+medv.step = step(medv.lm, k=log(n))
+```
+
+Then we use the BAS library to perform regression with BIC while defining a uniform distribution over the models. Then we select the best model according to the BIC criterion, the one with the largest logmarg, that consider the features CRIM, ZN, NOX, RM, DIS, RAD, TAX, PTRATIO, B, LSTAT.
+
+```{r}
+medv.BIC = bas.lm(MEDV ~ ., data = housing,
+                 prior = "BIC", modelprior = uniform())
+
+round(summary(medv.BIC), 3)
+
+# Find the index of the model with the largest logmarg
+best = which.max(medv.BIC$logmarg)
+# Retreat the index of variables in the best model, 0 is the intercept index
+bestmodel = medv.BIC$which[[best]]+1
+
+print(bestmodel)
+
+# 0 vector with length equal to the number of variables in the full model
+bestgamma = rep(0, medv.BIC$n.vars)
+# Change the indicator to 1 where variables are used
+bestgamma[bestmodel] = 1
+
+print(medv.BIC)
+```
+
+### Best BIC
+
+Then we use parameter found for the best BIC model and fit the best BIC model over the data and we compute the confidence interval over the parameters given by the best BIC model.
+
+```{r}
+# Fit the best BIC model. Impose the variables to use via bestgamma
+medv.bestBIC = bas.lm(MEDV ~ ., data = housing, prior = "BIC",
+                     modelprior=uniform(), n.models=1, bestmodel=bestgamma)
+
+# Retreat coefficients information
+medv.coef = coef(medv.bestBIC)
+
+# Retreat bounds of credible intervals
+out = confint(medv.coef)[, 1:2]
+
+# Combine results and construct summary table
+coef.BIC = cbind(medv.coef$postmean, medv.coef$postsd, out)
+names = c("post mean", "post sd", colnames(out))
+colnames(coef.BIC) = names
+
+round(coef.BIC[bestmodel,], 3)
+
+# Plot best regressors
+par(mfrow=c(1,2))
+plot(medv.coef, subset = (bestmodel)[-1], ask = F)
+```
+
+```{r}
+plot(confint(coef(medv.bestBIC)),main="best-BIC ",cex.axis = 0.5)
+
+```
+
+### Prediction
+
+We separate the dataset in a training set and a test set of 147 samples, following the standard 70%-30% split.
+
+Then we execute Bayesian Linear regression over the training set with the parameter of the best BIC model and use the obtained model to predict the value in the test set.
+
+```{r}
+n=147
+nend=length(housing[,1])
+newdata<-housing[1:n,]
+datalearning<-housing[seq(n+1,nend),]
+#dim(datalearning)
+rownames(datalearning)=seq(1:length(datalearning[,1]))
+
+#plot(confint(betaZS2),main="ZS-prior ")
+
+medv.bestBIC = bas.lm(MEDV ~ ., data = datalearning, prior = "BIC",
+                     modelprior=uniform(), n.models=1, bestmodel=bestgamma)
+beta = coef(medv.bestBIC)
+
+fitted<-predict(medv.bestBIC, estimator = "BMA")
+prednew <- predict(medv.bestBIC,newdata=newdata, estimator = "BMA", se.fit=TRUE)
+
+plot(fitted$Ypred[1:length(fitted$Ypred)],datalearning$MEDV[1:length(fitted$Ypred)],
+  pch = 16,
+  xlab = expression(hat(mu[i])), ylab = 'Y',type="p")
+
+points(prednew$Ypred, newdata$MEDV,
+  pch = 16,
+  col="red",type="p"
+)
+abline(0, 1)
+
+
+#prednew$Ypred 
+#newdata$Bodyfat
+
+
+#BPM <- predict(medv.bestBIC, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+conf.fit <- confint(prednew, parm = "mean")
+conf.pred <- confint(prednew, parm = "pred")
+plot(conf.pred, main="Out of sample: pred. (black) vs true (red)",cex.axis = 0.5)
+points(seq(1:n),newdata$MEDV,col="red")
+
+rmse = rmse(conf.fit,newdata$MEDV)
+print(rmse)
+```

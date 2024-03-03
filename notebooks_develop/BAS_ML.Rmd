@@ -1,0 +1,121 @@
+---
+title: "Bayesian Linear Regressio"
+output: html_notebook
+---
+
+# Bayesian Linear Regression
+
+Load the data set and the necessary libraries.
+
+```{r}
+options(warn = - 1)  
+library("dplyr")
+library(BAS)
+library(Metrics)
+housing <- read.csv("housing.csv",header=T)
+housing$X=c()
+housing <- filter(housing,housing$MEDV!= 50)
+summary(housing)
+```
+
+### G-Prior
+
+We execute bayesian linear regression considering a G-prior over the parameters with $\alpha$ = 100 and compute the mean value of the coefficents, their confidence interval and the probability of being in the model
+
+```{r}
+alphapar=100
+medv.basGP = bas.lm(MEDV ~ ., data = housing, prior="g-prior",alpha=alphapar, modelprior = Bernoulli(1), include.always = ~ .,bestmodel=rep(1,5),n.models = 1)
+betaGP = coef(medv.basGP)
+betaGP
+plot(betaGP, subset = 1:10, ask = F)
+confint(betaGP)
+plot(confint(betaGP),main=paste("g-prior alpha=",alphapar),cex.axis = 0.5)
+```
+
+### JZS Prior
+
+We execute bayesian linear regression considering a JZS over the parameters and compute the mean value of the coefficents, their confidence interval and the probability of being in the model
+
+```{r}
+medv.basZS = bas.lm(MEDV ~ ., data =  housing, prior="JZS", modelprior = Bernoulli(1), include.always = ~ ., n.models = 1)
+betaZS = coef(medv.basZS)
+betaZS
+plot(betaZS,subset = 2:7, ask = F)
+
+confint(betaZS)
+plot(confint(betaZS),main="ZS-prior ",cex.axis = 0.5)
+```
+
+### Prediction
+
+We separate the dataset in a training set and a test set of 147 samples, following the standard 70%-30% split.
+
+Then we execute Bayesian Linear regression over the training set with the JZS prior and use obtained model to predict the value in the test set.
+
+```{r}
+n=147
+nend=length(housing[,1])
+newdata<-housing[1:n,]
+datalearning<-housing[seq(n+1,nend),]
+#dim(datalearning)
+rownames(datalearning)=seq(1:length(datalearning[,1]))
+
+medv.basZS2 = bas.lm(MEDV ~ ., data =  datalearning, prior="JZS", modelprior = Bernoulli(1), include.always = ~ ., n.models = 1)
+betaZS2 = coef(medv.basZS2)
+#plot(confint(betaZS2),main="ZS-prior ")
+medv.basGP2 = bas.lm(MEDV ~ ., data =  datalearning, prior="g-prior", modelprior = Bernoulli(1), include.always = ~ ., n.models = 1)
+betaGP2 = coef(medv.basGP2)
+
+
+fitted<-predict(medv.basZS2, estimator = "BMA")
+prednew <- predict(medv.basZS2,newdata=newdata, estimator = "BMA")
+
+plot(fitted$Ypred[1:length(fitted$Ypred)],datalearning$MEDV[1:length(fitted$Ypred)],
+  pch = 16,
+  xlab = expression(hat(mu[i])), ylab = 'Y',type="p")
+
+points(prednew$Ypred, newdata$MEDV,
+  pch = 16,
+  col="red",type="p"
+)
+abline(0, 1)
+
+
+
+BPM <- predict(medv.basZS2, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+conf.fit <- confint(BPM, parm = "mean")
+conf.pred <- confint(BPM, parm = "pred")
+plot(conf.pred, main="Out of sample: pred. (black) vs true (red)",cex.axis = 0.5)
+points(seq(1:n),newdata$MEDV,col="red")
+
+rmse = rmse(conf.fit,newdata$MEDV)
+print(rmse)
+```
+
+Here we do the same prediction excercise but using the model found with the Zellner's informative g-prior
+
+```{r}
+fitted<-predict(medv.basGP2, estimator = "BMA")
+prednew <- predict(medv.basGP2,newdata=newdata, estimator = "BMA")
+
+plot(fitted$Ypred[1:length(fitted$Ypred)],datalearning$MEDV[1:length(fitted$Ypred)],
+  pch = 16,
+  xlab = expression(hat(mu[i])), ylab = 'Y',type="p")
+
+points(prednew$Ypred, newdata$MEDV,
+  pch = 16,
+  col="red",type="p"
+)
+abline(0, 1)
+
+
+
+BPM <- predict(medv.basGP2, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+conf.fit <- confint(BPM, parm = "mean")
+conf.pred <- confint(BPM, parm = "pred")
+plot(conf.pred, main="Out of sample: pred. (black) vs true (red)",cex.axis = 0.5)
+points(seq(1:n),newdata$MEDV,col="red")
+
+rmse = rmse(conf.fit,newdata$MEDV)
+print(rmse)
+```

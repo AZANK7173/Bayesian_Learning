@@ -1,0 +1,414 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Model Selection with JAGS
+
+Load the data set and the necessary libraries and filter the outliers from the dataset, the one with a MEDV value equal to 50.
+
+```{r}
+options(warn = - 1)  
+library("rjags")
+library(Metrics)
+library("dplyr")
+library(BAS)
+housing <- read.csv("housing.csv",header=T)
+housing$X=c()
+housing <- filter(housing,housing$MEDV!= 50)
+summary(housing)
+```
+
+Define the design matrix and the outcome vector to use for the JAGS model.
+
+```{r}
+# Select a data subset
+sub.idx = 1:13  
+num.data = nrow(housing)
+
+# Define outcome and design matrix
+X <- as.matrix(housing[1:num.data,sub.idx])
+Y <- as.vector(housing[1:num.data,14])
+
+# Get dimensions
+N <- dim(X)[1]
+p <- dim(X)[2]
+```
+
+## Spike and Slab
+
+Define the Spike and Slab model over the parameter and consider a normal distribution for the single data with mean depending on the parameters.
+
+```{r}
+# Define model
+cat(
+  "
+  model {
+    # Likelihood 
+    for (i in 1:N) {
+    	mu[i] <- beta0 + inprod(X[i,], beta)
+    	Y[i] ~ dnorm(mu[i],tau)
+    } 
+    
+    # Tracing the visited model
+    for (j in 1:p) {
+    	TempIndicator[j] <- g[j]*pow(2, j) 
+    }
+    mdl <- 1 + sum(TempIndicator[]) # model index in binary coding 
+  
+    # Gaussian distribution is parametrized in terms of precision parameter
+    beta0 ~ dnorm(0, 0.001)
+  
+    for(j in 1:p) {
+    	tprior[j] <- 1 / var_beta[j]
+    	bprior[j] <- 0
+    }
+  
+    for(j in 1:p) {
+    	beta_temp[j] ~ dnorm(bprior[j], tprior[j])
+    	g[j] ~ dbern(theta[j])
+    	theta[j] ~ dunif(0,1)
+    	beta[j] <- g[j] * beta_temp[j]	
+    }
+    tau ~ dgamma(0.001,0.001)
+  }
+  "
+, file = "models/SpSl_housing.bug")
+
+# Data to pass to JAGS
+data_JAGS_SpSl <- list(N = N, p = p, Y = Y, X = as.matrix(X), var_beta = rep(1, p))
+
+# A list of initial value for the MCMC algorithm 
+inits = function() {
+  list(beta0 = 0.0, beta_temp = rep(0,p), g = rep(0,p), theta = rep(0.5, p),
+       .RNG.seed = 321, .RNG.name = 'base::Wichmann-Hill') 
+}
+
+# Compile model (+ adaptation)
+model <- jags.model("models/SpSl_housing.bug", data = data_JAGS_SpSl,
+                    n.adapt = 1000, inits = inits, n.chains = 1) 
+```
+
+```{r}
+# if we want to perform a larger burn in with not adaptation.
+cat("  Updating...\n")
+update(model,n.iter=5000)
+
+# Posterior parameters JAGS has to track
+param <- c("beta0", "beta", "g", "mdl")
+
+# Number of iterations & thinning
+nit <- 50000
+thin <- 10
+```
+
+```{r}
+# Sampling (this may take a while)
+cat("  Sampling...\n")
+outputSpSl <- coda.samples(model = model,
+                       variable.names = param,
+                       n.iter = nit,
+                       thin = thin)
+
+# Save the chain
+save(output, file = 'chains/SpSl.dat')
+```
+
+Traces of the MCMC obtained.
+
+```{r}
+# Plot command for coda::mcmc objects (4 at a time for visual purposes)
+for(K in 0:13){
+  plot(outputSpSl[,(2*K+1):(2*(K+1))])
+}
+```
+
+```{r}
+# Summary command for coda::mcmc objects
+summary(outputSpSl)
+```
+
+```{r}
+# Cast output as matrix
+outputSpSl <- as.matrix(outputSpSl)
+```
+
+```{r}
+param = outputSpSl[,c(14,1:13)]
+param_mean = apply(param, 2, "mean")
+param_confint =apply(param, 2, quantile, c(0.025, 0.975))
+plot(param_mean, main="Spike and Slab",ylim = c(0,50),xlim = c(1,14),cex.axis = 0.7,pch = 16,xaxt = "n")
+axis(1, at=1:14, labels=c("Intercept",colnames(X)),cex.axis = 0.5) 
+for(i in 1:14){
+  arrows(i, param_confint[1,i], i, param_confint[2,i], length=0.05, angle=90, code=3)
+}
+```
+
+```{r}
+# We save the posterior chain of the inclusion variable in post_g
+post_g <- as.matrix(outputSpSl[,15:27])
+post_beta <- as.matrix(outputSpSl[,1:13])
+apply(post_g, 2, "mean")
+post_mean_g <- apply(post_g, 2, "mean") 
+```
+
+### Median Probability Model
+
+We consider the posterior mean of the inclusion variable for each parameter and keep all parameter that have mean higher than $50\%$
+
+```{r}
+library(ggplot2)
+# Plot
+df <- data.frame(value = post_mean_g, var = colnames(X))
+p1 <- ggplot(data = df, aes(y = value, x = var, fill = var)) + 
+  geom_bar(stat="identity") + 
+  geom_hline(mapping = aes(yintercept = .5), col = 2, lwd = 1.1) +
+  coord_flip() + theme_minimal() + theme(legend.position="none") + 
+  ylab("Posterior Inclusion Probabilities") + xlab("")
+p1
+```
+
+```{r}
+# Select best model according to MPM
+mp_SpSl <- as.vector(which(post_mean_g > 0.5))
+post_mean_g[mp_SpSl]
+print(colnames(X)[mp_SpSl])
+```
+
+### Highest Posterior Density Model
+
+In the HPD model we select the model that was selected with the highest frequency in the Markov Chain.
+
+```{r}
+# Plot the mdl chain
+plot(outputSpSl[,"mdl"], pch = 20, xlab = "Iteration", ylab = "Model")
+```
+
+```{r}
+# Number of models visited
+length(unique( outputSpSl[,"mdl"]))
+```
+
+```{r}
+# Post frequency of visited models
+visited_models <- sort(table(outputSpSl[,"mdl"]), decreasing = TRUE)
+barplot(visited_models, xlab = "N° Model", ylab = "Posterior Frequency")
+```
+
+```{r}
+# Getting the unique profiles and sort the results
+unique_model <- unique(post_g, MARGIN = 1)
+freq <- apply(unique_model, 1,
+              function(b) sum(apply(post_g, MARGIN = 1, function(a) all(a == b))))
+cbind(unique_model[order(freq,decreasing = T),], sort(freq,decreasing = T))
+```
+
+```{r}
+colnames(X)[as.logical(unique_model[which.max(freq),])]
+HDP_SpSl <- c(1:13)[as.logical(unique_model[which.max(freq),])]
+```
+
+### Prediction
+
+For the prediction we use jags to fit the data using the subset of parameters that were found with the different criteria.
+
+For the prediction we consider the standard 30% -70% division of the dataset.
+
+#### MPD
+
+```{r}
+
+# Define model
+cat(
+  "
+  model {
+    # Likelihood 
+    for (i in 148:N) {
+    	mu[i] <- beta0 + inprod(X[i,], beta)
+    	Y[i] ~ dnorm(mu[i],tau)
+    } 
+    
+    #pred
+    for (i in 1:147) {
+    	pred_mu[i] <- beta0 + inprod(X[i,], beta)
+    	pred_Y[i] ~ dnorm(pred_mu[i],tau)
+    } 
+    # Gaussian distribution is parametrized in terms of precision parameter
+    beta0 ~ dnorm(0, 0.001)
+  
+    for(j in 1:p) {
+    	tprior[j] <- 1 / var_beta[j]
+    	bprior[j] <- 0
+    }
+  
+    for(j in 1:p) {
+    	beta[j] ~ dnorm(bprior[j], tprior[j])
+    }
+    tau ~ dgamma(0.001,0.001)
+  }
+  "
+, file = "models/pred_housing.bug")
+
+# Data to pass to JAGS
+data_JAGS_pred <- list(N = N, p = length(mp_SpSl), Y = Y, X = as.matrix(X)[,mp_SpSl], var_beta = rep(1, length(mp_SpSl)))
+
+# A list of initial value for the MCMC algorithm 
+inits = function() {
+  list(beta0 = 0.0,.RNG.seed = 321, .RNG.name = 'base::Wichmann-Hill') 
+}
+
+# Compile model (+ adaptation)
+model <- jags.model("models/pred_housing.bug", data = data_JAGS_pred,
+                    n.adapt = 1000, inits = inits, n.chains = 1) 
+
+```
+
+```{r}
+# if we want to perform a larger burn in with not adaptation.
+cat("  Updating...\n")
+update(model,n.iter=5000)
+
+# Posterior parameters JAGS has to track
+param <- c("beta0", "beta", "pred_Y")
+
+# Number of iterations & thinning
+nit <- 50000
+thin <- 10
+```
+
+```{r}
+# Sampling (this may take a while)
+cat("  Sampling...\n")
+outputMPD <- coda.samples(model = model,
+                       variable.names = param,
+                       n.iter = nit,
+                       thin = thin)
+
+# Save the chain
+save(output, file = 'chains/pred.dat')
+```
+
+```{r}
+# Summary command for coda::mcmc objects
+summary(output)
+```
+
+```{r}
+outMPD <- as.matrix(outputMPD)
+param = outMPD[,c(length(mp_SpSl)+1,1:length(mp_SpSl))]
+param_mean = apply(param, 2, "mean")
+param_confint =apply(param, 2, quantile, c(0.025, 0.975))
+plot(param_mean, main="MDP",ylim = c(0,50),xlim = c(1,14),cex.axis = 0.7,pch = 16,xaxt = "n")
+axis(1, at=1:(length(mp_SpSl)+1), labels=c("Intercept",colnames(X)[mp_SpSl]),cex.axis = 0.5) 
+for(i in 1:(length(mp_SpSl)+1)){
+  arrows(i, param_confint[1,i], i, param_confint[2,i], length=0.05, angle=90, code=3)
+}
+```
+
+```{r}
+# Cast output as matrix
+pred = outMPD[,(length(mp_SpSl)+2):(length(mp_SpSl)+148)]
+pred_mean = apply(pred, 2, "mean")
+pred_confint =apply(pred, 2, quantile, c(0.025, 0.975))
+
+aa = aa=hist(pred[,1],seq(-100,100,1),probability=TRUE,)
+```
+
+```{r}
+#BPM <- predict(medv.bestBIC, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+#conf.fit <- confint(pred, parm = "mean")
+#conf.pred <- confint(pred, parm = "pred")
+plot(pred_mean, main="Out of sample: pred. (black) vs true (red)",ylim=c(0,50),cex.axis = 0.7,pch = 16)
+for(i in 1:147){
+  arrows(i, pred_confint[1,i], i, pred_confint[2,i], length=0.05, angle=90, code=3)
+}
+points(seq(1:147),Y[1:147],col="red")
+
+rmse = rmse(pred_mean,Y[1:147])
+mae = mae(pred_mean,Y[1:147])
+print(rmse)
+print(mae)
+```
+
+#### HPD
+
+```{r}
+# Data to pass to JAGS
+data_JAGS_pred <- list(N = N, p = length(HDP_SpSl), Y = Y, X = as.matrix(X)[,HDP_SpSl], var_beta = rep(1, length(HDP_SpSl)))
+
+# A list of initial value for the MCMC algorithm 
+inits = function() {
+  list(beta0 = 0.0,.RNG.seed = 321, .RNG.name = 'base::Wichmann-Hill') 
+}
+
+# Compile model (+ adaptation)
+model <- jags.model("models/pred_housing.bug", data = data_JAGS_pred,
+                    n.adapt = 1000, inits = inits, n.chains = 1) 
+```
+
+```{r}
+# if we want to perform a larger burn in with not adaptation.
+cat("  Updating...\n")
+update(model,n.iter=5000)
+
+# Posterior parameters JAGS has to track
+param <- c("beta0", "beta", "pred_Y")
+
+# Number of iterations & thinning
+nit <- 50000
+thin <- 10
+```
+
+```{r}
+# Sampling (this may take a while)
+cat("  Sampling...\n")
+outputHPD <- coda.samples(model = model,
+                       variable.names = param,
+                       n.iter = nit,
+                       thin = thin)
+
+# Save the chain
+save(output, file = 'chains/pred.dat')
+```
+
+```{r}
+# Summary command for coda::mcmc objects
+summary(output)
+```
+
+```{r}
+outHPD <- as.matrix(output)
+param = outHPD[,c(length(HDP_SpSl)+1,1:length(HDP_SpSl))]
+param_mean = apply(param, 2, "mean")
+param_confint =apply(param, 2, quantile, c(0.025, 0.975))
+plot(param_mean, main="HDP",ylim = c(0,50),xlim = c(1,14),cex.axis = 0.7,pch = 16,xaxt = "n")
+axis(1, at=1:(length(HDP_SpSl)+1), labels=c("Intercept",colnames(X)[HDP_SpSl]),cex.axis = 0.5) 
+for(i in 1:(length(HDP_SpSl)+1)){
+  arrows(i, param_confint[1,i], i, param_confint[2,i], length=0.05, angle=90, code=3)
+}
+```
+
+```{r}
+# Cast output as matrix
+pred = outHPD[,(length(HDP_SpSl)+2):(length(HDP_SpSl)+148)]
+pred_mean = apply(pred, 2, "mean")
+pred_confint =apply(pred, 2, quantile, c(0.025, 0.975))
+
+aa = aa=hist(pred[,1],seq(-100,100,1),probability=TRUE,)
+```
+
+```{r}
+#BPM <- predict(medv.bestBIC, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+#conf.fit <- confint(pred, parm = "mean")
+#conf.pred <- confint(pred, parm = "pred")
+plot(pred_mean, main="Out of sample: pred. (black) vs true (red)",ylim = c(0,50),cex.axis = 0.7,pch = 16)
+for(i in 1:147){
+  arrows(i, pred_confint[1,i], i, pred_confint[2,i], length=0.05, angle=90, code=3)
+}
+points(seq(1:147),Y[1:147],col="red")
+
+rmse = rmse(pred_mean,Y[1:147])
+mae = mae(pred_mean,Y[1:147])
+print(rmse)
+print(mae)
+```

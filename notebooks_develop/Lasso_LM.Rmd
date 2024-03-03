@@ -1,0 +1,255 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# LASSO Penilized Bayesian Regression
+
+Load the data set and the necessary libraries and filter the outliers from the dataset, the one with a MEDV value equal to 50.
+
+```{r}
+options(warn = - 1)
+library("rjags")
+library(Metrics)
+library("dplyr")
+library(BAS)
+housing <- read.csv("housing.csv",header=T)
+housing$X=c()
+housing <- filter(housing,housing$MEDV!= 50)
+summary(housing)
+```
+
+Define the design matrix and the outcome vector to use for the JAGS model.
+
+```{r}
+# Select a data subset
+sub.idx = 1:13
+num.data = nrow(housing)
+# Define outcome and design matrix
+X <- as.matrix(housing[1:num.data,sub.idx])
+Y <- as.vector(housing[1:num.data,14])
+# Get dimensions
+N <- dim(X)[1]
+p <- dim(X)[2]
+```
+
+## LASSO Model
+
+```{r}
+# Define the JAGS model
+cat(
+  "
+  model {
+    # Likelihood     
+  	for (i in 1:N) {
+  		Y[i] ~ dnorm(beta0 + X[i,] %*% beta[],tau) 
+  	} 
+  
+    # Prior
+  	beta0 ~ dnorm(0.0, 0.02)
+    for (j in 1:P) {
+  	 	beta[j] ~ ddexp(0.0, 1.0/(lambda2^0.5))
+  	}
+  	lambda2 ~ dgamma(0.1,0.1);
+  	tau ~ dgamma(0.001,0.001)
+  }
+  "
+, file = "models/lasso.bug")
+
+data_win <- list(N = N, P = p, Y = Y, X = as.matrix(X))
+```
+
+```{r}
+# Parameters of interest
+params.to.save <- c("beta0", "beta", "lambda2","tau")
+
+# Compile the model
+model <- jags.model(file = "models/lasso.bug",
+                    data = data_win, n.adapt = 1000)
+```
+
+```{r}
+# Sampler burin-in phase
+cat("  Updating...\n")
+update(model, n.iter = 5000)
+```
+
+```{r}
+# Sampling from the posterior
+cat("  Sampling...\n")
+results <- coda.samples(model, variable.names = params.to.save,
+                        n.iter = 50000, thin = 10)
+
+# Save the chain
+save(results, file = 'chains/lasso.dat')
+```
+
+```{r}
+summary(results)
+```
+
+### Shrinkage Parameter $\lambda$
+
+```{r}
+# shrinkage
+shr_param <- sqrt(as.matrix(results)[,"lambda2"])
+ggplot(data.frame(x=shr_param, y = as.factor("lambda2"))) + 
+  geom_density(aes(x=shr_param, fill = y)) + 
+  theme_minimal() + theme(legend.position="none") +
+  xlab("Shrinkage Parameter") + ylab("Density")
+```
+
+### Feature Selection
+
+Lasso keeps the feature for which the confidence interval of their parameter does not include zero.
+
+```{r}
+# Extract other values of the chain
+beta0 <- as.matrix(results)[,"beta0"]
+tau <- as.matrix(results)[,"tau"]
+beta <- as.matrix(results[,1:p])
+
+CI_beta = apply(beta, 2, quantile, c(0.025, 0.975)) 
+CI_beta
+```
+
+We compute the mean as point estimate and the confidence intervals.
+
+```{r}
+# For loop to check the included variables
+idx_cov_BL = NULL
+for(l in 1:p){
+  if(CI_beta[1,l]<0 && CI_beta[2,l]>0) {
+    cat("*** variable ", colnames(X)[l], " excluded \n")
+  }
+  else {
+    cat("*** variable ", colnames(X)[l], " included \n")
+    idx_cov_BL = c(idx_cov_BL, l)
+  }
+}
+
+# Compute posterior mean
+mean_beta_post <- apply(beta, 2, "mean")
+mean_beta_post
+```
+
+```{r}
+# PLOT THE CI
+gplots::plotCI(x = 1:p, y = mean_beta_post,
+               liw = (-CI_beta[1,] + mean_beta_post),
+               uiw = (CI_beta[2,] - mean_beta_post),
+               type = "n", lwd = 1.5,
+               main="Decision intervals for HS", ylab = "", xlab = "")
+points(1:p, mean_beta_post, pch=16)
+abline(h = 0, col = "blue")
+```
+
+### Prediction
+
+```{r}
+
+# Define model
+cat(
+  "
+  model {
+    # Likelihood 
+    for (i in 148:N) {
+    	mu[i] <- beta0 + inprod(X[i,], beta)
+    	Y[i] ~ dnorm(mu[i],tau)
+    } 
+    
+    #pred
+    for (i in 1:147) {
+    	pred_mu[i] <- beta0 + inprod(X[i,], beta)
+    	pred_Y[i] ~ dnorm(pred_mu[i],tau)
+    } 
+    
+  	beta0 ~ dnorm(0.0, 0.02)
+    for (j in 1:p) {
+  	 	beta[j] ~ ddexp(0.0, 1.0/(lambda2^0.5))
+  	}
+  	lambda2 ~ dgamma(0.1,0.1);
+  	tau ~ dgamma(0.001,0.001)
+  }
+  "
+, file = "models/pred_housing.bug")
+
+# Data to pass to JAGS
+data_JAGS_pred <- list(N = N, p = length(idx_cov_BL), Y = Y, X = as.matrix(X)[,idx_cov_BL])
+
+# A list of initial value for the MCMC algorithm 
+inits = function() {
+  list(beta0 = 0.0,.RNG.seed = 321, .RNG.name = 'base::Wichmann-Hill') 
+}
+
+# Compile model (+ adaptation)
+model <- jags.model("models/pred_housing.bug", data = data_JAGS_pred,
+                    n.adapt = 1000, inits = inits, n.chains = 1) 
+```
+
+```{r}
+# if we want to perform a larger burn in with not adaptation.
+cat("  Updating...\n")
+update(model,n.iter=5000)
+
+# Posterior parameters JAGS has to track
+param <- c("beta0", "beta", "pred_Y")
+
+# Number of iterations & thinning
+nit <- 50000
+thin <- 10
+```
+
+```{r}
+# Sampling (this may take a while)
+cat("  Sampling...\n")
+output <- coda.samples(model = model,
+                       variable.names = param,
+                       n.iter = nit,
+                       thin = thin)
+
+# Save the chain
+save(output, file = 'chains/pred.dat')
+```
+
+```{r}
+# Summary command for coda::mcmc objects
+summary(output)
+```
+
+```{r}
+out <- as.matrix(output)
+param = out[,c(length(idx_cov_BL)+1,1:length(idx_cov_BL))]
+param_mean = apply(param, 2, "mean")
+param_confint =apply(param, 2, quantile, c(0.025, 0.975))
+plot(param_mean, main="Lasso",xlim = c(1,14),cex.axis = 0.7,pch = 16,xaxt = "n")
+axis(1, at=1:(length(idx_cov_BL)+1), labels=c("Intercept",colnames(X)[idx_cov_BL]),cex.axis = 0.5) 
+for(i in 1:length(idx_cov_BL)+1){
+  arrows(i, param_confint[1,i], i, param_confint[2,i], length=0.05, angle=90, code=3)
+}
+```
+
+```{r}
+# Cast output as matrix
+pred = out[,(length(idx_cov_BL)+2):(length(idx_cov_BL)+148)]
+pred_mean = apply(pred, 2, "mean")
+pred_confint =apply(pred, 2, quantile, c(0.025, 0.975))
+
+aa = aa=hist(pred[,1],seq(-100,100,1),probability=TRUE,)
+```
+
+```{r}
+#BPM <- predict(medv.bestBIC, estimator = "BPM", newdata=newdata,se.fit = TRUE)
+#conf.fit <- confint(pred, parm = "mean")
+#conf.pred <- confint(pred, parm = "pred")
+plot(pred_mean, main="Out of sample: pred. (black) vs true (red)",ylim=c(0,50),cex.axis = 0.7,pch = 16)
+for(i in 1:147){
+  arrows(i, pred_confint[1,i], i, pred_confint[2,i], length=0.05, angle=90, code=3)
+}
+points(seq(1:147),Y[1:147],col="red")
+
+rmse = rmse(pred_mean,Y[1:147])
+mae = mae(pred_mean,Y[1:147])
+print(rmse)
+print(mae)
+```
